@@ -1,0 +1,21 @@
+# Private credentials and local configuration
+.env
+.env.*
+!.env.example
+
+# Local databases, user uploads, and migration backups
+data/
+uploads/
+migration-backups/
+*.db
+*.sqlite
+*.sqlite3
+*.db-*
+*.sqlite-*
+
+# Local dependencies, logs, and generated test output
+node_modules/
+*.log
+coverage/
+
+auth-flow-check/

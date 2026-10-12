@@ -1,0 +1,70 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createHash, randomBytes } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createServer } from 'node:net';
+import { DatabaseSync } from 'node:sqlite';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const root=fileURLToPath(new URL('..',import.meta.url));
+const mockMailer=fileURLToPath(new URL('./support/mock-resend.mjs',import.meta.url));
+const freePort=()=>new Promise((resolve,reject)=>{const s=createServer();s.once('error',reject);s.listen(0,'127.0.0.1',()=>{const {port}=s.address();s.close(error=>error?reject(error):resolve(port))})});
+const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+
+test('email signup, verification, resend, sign-in, sign-out, reset, and provider failures work end to end',async t=>{
+  const dir=await mkdtemp(join(tmpdir(),'aroused-auth-flow-')),port=await freePort(),capture=join(dir,'resend-capture.json');
+  let db;
+  const publicUrl=`http://127.0.0.1:${port}`;
+  const env={...process.env,NODE_ENV:'test',AROUSED_API_PORT:String(port),AROUSED_PUBLIC_URL:publicUrl,AROUSED_DATA_DIR:join(dir,'data'),AROUSED_UPLOAD_DIR:join(dir,'uploads'),AROUSED_TEST_RESEND_CAPTURE_FILE:capture,RESEND_API_KEY:'test-only-never-sent',AROUSED_FROM_EMAIL:'Aroused <verify@example.test>',AROUSED_EMAIL_CODE_SECRET:'test-only-code-secret-not-a-production-secret',GOOGLE_OAUTH_CLIENT_ID:'test-google-id',GOOGLE_OAUTH_CLIENT_SECRET:'test-google-secret',REDDIT_OAUTH_CLIENT_ID:'test-reddit-id',REDDIT_OAUTH_CLIENT_SECRET:'test-reddit-secret',X_OAUTH_CLIENT_ID:'test-x-id',X_OAUTH_CLIENT_SECRET:'test-x-secret'};
+  const child=spawn(process.execPath,['--import',pathToFileURL(mockMailer).href,'server.mjs'],{cwd:root,env,stdio:['ignore','pipe','pipe']});
+  let logs='';child.stdout.on('data',data=>logs+=data.toString());child.stderr.on('data',data=>logs+=data.toString());
+  t.after(async()=>{db?.close();if(child.exitCode===null)await new Promise(resolve=>{child.once('exit',resolve);child.kill('SIGTERM');setTimeout(resolve,2000).unref()});await rm(dir,{recursive:true,force:true})});
+  const base=`http://127.0.0.1:${port}/api`;
+  let ready=false;for(let i=0;i<100;i++){if(child.exitCode!==null)throw new Error(`Auth test server exited during startup: ${logs}`);try{ready=(await fetch(`${base}/health`)).ok;if(ready)break}catch{}await sleep(100)}assert.ok(ready,`Auth test server did not start: ${logs}`);
+  db=new DatabaseSync(join(dir,'data','aroused.sqlite'));
+  const json={ 'Content-Type':'application/json','Sec-Fetch-Site':'same-origin' };
+  const call=(path,body,cookie='')=>fetch(`${base}${path}`,{method:'POST',headers:{...json,...(cookie?{Cookie:cookie}:{})},body:JSON.stringify(body)});
+  const startOAuth=(provider,mode,body={},cookie='')=>call(`/auth/oauth/${provider}/start`,{mode,...body},cookie);
+  const finishOAuth=async(provider,start,code='test-code')=>{
+    const authorization=new URL((await start.json()).authorizationUrl),state=authorization.searchParams.get('state'),stateCookie=start.headers.get('set-cookie').split(';')[0];
+    const response=await fetch(`${base}/auth/oauth/${provider}/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`,{headers:{Cookie:stateCookie},redirect:'manual'});
+    return {response,state,stateCookie};
+  };
+  const signup=email=>call('/auth/signup',{displayName:'Flow Tester',email,password:'VeryStrong!TestPass987',adultConfirmed:true,termsAccepted:true,guidelinesAccepted:true});
+  const readCapture=async()=>JSON.parse(await readFile(capture,'utf8'));
+  const codeFrom=payload=>payload.text.match(/\b(\d{6})\b/)?.[1];
+
+  const unavailable=await signup('reject-flow@example.test');assert.equal(unavailable.status,422);assert.match((await unavailable.json()).error,/temporarily unavailable/i);assert.equal(db.prepare('SELECT 1 FROM pending_email_verifications WHERE email=?').get('reject-flow@example.test'),undefined);
+  const accepted=await signup('flow-tester@example.test');assert.equal(accepted.status,202);assert.equal((await accepted.json()).message,'If this address can be verified, a code will be sent.');
+  let mail=await readCapture(),firstCode=codeFrom(mail);assert.match(firstCode,/^\d{6}$/);assert.equal(mail.to[0],'flow-tester@example.test');
+  let pending=db.prepare('SELECT code_hash,expires_at,next_send_at FROM pending_email_verifications WHERE email=?').get(mail.to[0]);assert.ok(pending);assert.notEqual(pending.code_hash,firstCode);assert.notEqual(pending.code_hash,createHash('sha256').update(firstCode).digest('hex'));assert.ok(Number(pending.expires_at)>Date.now()&&Number(pending.expires_at)<=Date.now()+10*60_000);
+  db.prepare('UPDATE pending_email_verifications SET next_send_at=0 WHERE email=?').run(mail.to[0]);
+  const resent=await call('/auth/resend-code',{email:mail.to[0]});assert.equal(resent.status,202);mail=await readCapture();const resentCode=codeFrom(mail);assert.match(resentCode,/^\d{6}$/);assert.notEqual(resentCode,firstCode);
+  const wrong=String((Number(resentCode)+1)%1_000_000).padStart(6,'0');assert.equal((await call('/auth/verify-email',{email:mail.to[0],code:wrong})).status,400);
+  const verified=await call('/auth/verify-email',{email:mail.to[0],code:resentCode});assert.equal(verified.status,201);const verifiedBody=await verified.json();assert.equal(verifiedBody.verified,true);const verifiedCookie=verified.headers.get('set-cookie');assert.match(verifiedCookie,/HttpOnly/i);const session=verifiedCookie.split(';')[0];
+  assert.equal((await fetch(`${base}/session`,{headers:{Cookie:session}})).status,200);assert.equal((await call('/auth/verify-email',{email:mail.to[0],code:resentCode})).status,400);
+  const loggedIn=await call('/auth/login',{email:mail.to[0],password:'VeryStrong!TestPass987'});assert.equal(loggedIn.status,200);const loginCookie=loggedIn.headers.get('set-cookie').split(';')[0];
+  for(let i=0;i<3;i++)assert.equal((await call('/auth/resend-code',{email:mail.to[0]})).status,202);assert.equal((await call('/auth/resend-code',{email:mail.to[0]})).status,429);
+  const knownBad=await call('/auth/login',{email:mail.to[0],password:'wrong'}),unknownBad=await call('/auth/login',{email:'absent@example.test',password:'wrong'});assert.equal(knownBad.status,401);assert.equal(unknownBad.status,401);assert.deepEqual(await knownBad.json(),await unknownBad.json());
+  const resetUnknown=await call('/auth/request-password-reset',{email:'absent@example.test'}),resetKnown=await call('/auth/request-password-reset',{email:mail.to[0]});assert.equal(resetUnknown.status,202);assert.equal(resetKnown.status,202);assert.deepEqual(await resetUnknown.json(),await resetKnown.json());
+  const resetMail=await readCapture(),resetToken=resetMail.text.match(/reset token is ([A-Za-z0-9_-]{40,60})/)?.[1];assert.ok(resetToken);const reset=await call('/auth/reset-password',{email:mail.to[0],token:resetToken,newPassword:'AnotherStrong!Pass989'});assert.equal(reset.status,200);assert.equal((await (await fetch(`${base}/session`,{headers:{Cookie:loginCookie}})).json()).user,null);
+  assert.equal((await call('/auth/login',{email:mail.to[0],password:'VeryStrong!TestPass987'})).status,401);const currentLogin=await call('/auth/login',{email:mail.to[0],password:'AnotherStrong!Pass989'});assert.equal(currentLogin.status,200);const currentCookie=currentLogin.headers.get('set-cookie').split(';')[0];
+  const logout=await call('/auth/logout',{},currentCookie);assert.equal(logout.status,200);assert.equal((await (await fetch(`${base}/session`,{headers:{Cookie:currentCookie}})).json()).user,null);
+  const expirySignup=await signup('expired-flow@example.test');assert.equal(expirySignup.status,202);const expiryMail=await readCapture(),expiryCode=codeFrom(expiryMail);db.prepare('UPDATE pending_email_verifications SET expires_at=? WHERE email=?').run(Date.now()-1,'expired-flow@example.test');assert.equal((await call('/auth/verify-email',{email:'expired-flow@example.test',code:expiryCode})).status,400);assert.equal(db.prepare('SELECT 1 FROM pending_email_verifications WHERE email=?').get('expired-flow@example.test'),undefined);
+  assert.doesNotMatch(logs,/VeryStrong!TestPass987|AnotherStrong!Pass989|test-only-never-sent|\b\d{6}\b|reset token is/);
+  assert.match(logs,/EMAIL_PROVIDER_REJECTED/);assert.match(logs,/email_delivery_failed/);
+
+  const oauthStatus=await (await fetch(`${base}/auth/oauth/providers`)).json();assert.deepEqual(Object.values(oauthStatus.providers).map(provider=>provider.available),[true,true,true]);
+  const googleStart=await startOAuth('google','signup',{adultConfirmed:true,termsAccepted:true,guidelinesAccepted:true});assert.equal(googleStart.status,200);const googleAuthUrl=new URL((await googleStart.clone().json()).authorizationUrl);assert.equal(googleAuthUrl.searchParams.get('scope'),'openid email profile');assert.equal(googleAuthUrl.searchParams.get('code_challenge_method'),'S256');
+  const badState=await fetch(`${base}/auth/oauth/google/callback?code=bad&state=wrong`,{redirect:'manual'});assert.equal(badState.status,400);
+  const googleResult=await finishOAuth('google',googleStart);assert.equal(googleResult.response.status,303);assert.match(googleResult.response.headers.get('location'),/oauthSignedIn=1/);
+  const googleSession=googleResult.response.headers.getSetCookie().find(value=>value.startsWith('aroused_session=')).split(';')[0];assert.equal((await (await fetch(`${base}/session`,{headers:{Cookie:googleSession}})).json()).user.email,'oauth-flow@example.test');
+  assert.equal(Number(db.prepare('SELECT adult_confirmed FROM users WHERE email=?').get('oauth-flow@example.test').adult_confirmed),1);assert.equal(Number(db.prepare('SELECT COUNT(*) n FROM policy_acceptances WHERE user_id=(SELECT id FROM users WHERE email=?)').get('oauth-flow@example.test').n),2);
+  const replay=await fetch(`${base}/auth/oauth/google/callback?code=test-code&state=${encodeURIComponent(googleResult.state)}`,{headers:{Cookie:googleResult.stateCookie},redirect:'manual'});assert.equal(replay.status,400);
+  const userCountBeforeSocialLogin=Number(db.prepare('SELECT COUNT(*) n FROM users').get().n),googleLogin=await startOAuth('google','login'),googleLoginResult=await finishOAuth('google',googleLogin);assert.equal(googleLoginResult.response.status,303);assert.equal(Number(db.prepare('SELECT COUNT(*) n FROM users').get().n),userCountBeforeSocialLogin);
+  const redditStart=await startOAuth('reddit','signup',{adultConfirmed:true,termsAccepted:true,guidelinesAccepted:true});const redditAuthUrl=new URL((await redditStart.clone().json()).authorizationUrl);assert.equal(redditAuthUrl.searchParams.get('scope'),'identity');assert.equal(redditAuthUrl.searchParams.has('code_challenge'),false);const redditResult=await finishOAuth('reddit',redditStart);assert.equal(redditResult.response.status,303);const redditSession=redditResult.response.headers.getSetCookie().find(value=>value.startsWith('aroused_session=')).split(';')[0];const redditUser=(await (await fetch(`${base}/session`,{headers:{Cookie:redditSession}})).json()).user;assert.equal(redditUser.email,null);
+  const linkStart=await startOAuth('x','link',{},redditSession);const xAuthUrl=new URL((await linkStart.clone().json()).authorizationUrl);assert.equal(xAuthUrl.searchParams.get('scope'),'users.read');assert.equal(xAuthUrl.searchParams.get('code_challenge_method'),'S256');const xLinked=await finishOAuth('x',linkStart);assert.equal(xLinked.response.status,303);assert.match(xLinked.response.headers.get('location'),/oauthLinked=1/);assert.equal(Number(db.prepare('SELECT COUNT(*) n FROM user_identities WHERE provider=? AND provider_user_id=? AND user_id=(SELECT id FROM users WHERE email IS NULL ORDER BY id DESC LIMIT 1)').get('x','x-test-id').n),1);
+});
